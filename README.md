@@ -2,7 +2,7 @@
 
 An interpreter and compiler for the Brainfuck language.
 
-## Prerequisited
+## Prerequisites
 
 You need a LLVM 16.0.* installation on your system. On Windows, you may need to
 build LLVM from source, since the pre-built binaries do not include everything
