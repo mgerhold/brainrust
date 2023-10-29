@@ -1,12 +1,29 @@
+use std::io;
+use std::path::Path;
+use std::process::{Command, Output};
+
+use anyhow::Result;
+
+use crate::emitter::emit;
 use crate::interpreter::interpret;
 use crate::parser::Parser;
 
-//mod emitter;
+mod emitter;
 mod interpreter;
 mod parser;
 mod program;
 
-fn main() {
+fn invoke_clang(input_file: &Path, output_file: &Path) -> io::Result<Output> {
+    Command::new("clang")
+        .args([
+            "-o",
+            output_file.to_str().unwrap(),
+            input_file.to_str().unwrap(),
+        ])
+        .output()
+}
+
+fn main() -> Result<()> {
     let hello_world = b"++++++++++
  [
   >+++++++>++++++++++>+++>+<<<<-
@@ -27,12 +44,11 @@ fn main() {
  +++.                    Wagenruecklauf";
 
     let parser = Parser::new(hello_world);
-    match parser.parse() {
-        Ok(program) => {
-            //println!("{program}");
-            interpret(&program);
-            //emit(&program);
-        }
-        Err(error) => eprint!("{error:?}"),
-    }
+    let program = parser.parse()?;
+
+    interpret(&program);
+    emit(&program);
+    invoke_clang(Path::new("test.o"), Path::new("test.exe"))?;
+
+    Ok(())
 }

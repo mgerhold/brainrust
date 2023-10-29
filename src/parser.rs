@@ -1,11 +1,20 @@
 use crate::program::{Program, Statement, StatementConversionError};
+use anyhow::Result;
+use std::fmt::{Display, Formatter};
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub(crate) enum ParserError {
     ClosingLoop,
     LoopNotClosed,
     UnexpectedChar(u8),
     EndOfSource,
+}
+
+impl Display for ParserError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 pub(crate) struct Parser<'a> {
