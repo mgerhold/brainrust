@@ -22,12 +22,12 @@ mod state {
 
         pub(super) fn increment_value(&mut self) {
             let index = self.checked_index();
-            self.memory[index] += 1;
+            self.memory[index] = self.memory[index].wrapping_add(1);
         }
 
         pub(super) fn decrement_value(&mut self) {
             let index = self.checked_index();
-            self.memory[index] -= 1;
+            self.memory[index] = self.memory[index].wrapping_sub(1);
         }
 
         pub(super) fn put_char(&mut self) {
