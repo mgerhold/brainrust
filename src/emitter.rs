@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::fmt::{Display, Formatter};
+use std::path::PathBuf;
 
 use inkwell::context::Context;
 use inkwell::module::Linkage;
@@ -8,13 +9,40 @@ use inkwell::targets::{
 };
 use inkwell::types::BasicMetadataTypeEnum;
 use inkwell::{AddressSpace, OptimizationLevel};
+use thiserror::Error;
 
+use crate::command_line_arguments::{CommandLineArguments, EmitTarget};
 use crate::program::Program;
 
-pub(crate) fn emit(program: &Program) {
+#[derive(Error, Debug)]
+pub(crate) enum EmitError {
+    FailedToWriteToFile(PathBuf),
+}
+
+impl Display for EmitError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmitError::FailedToWriteToFile(filename) => {
+                write!(
+                    f,
+                    "failed to write contents to file '{}'",
+                    filename.display()
+                )
+            }
+        }
+    }
+}
+
+pub(crate) fn emit(program: &Program, arguments: &CommandLineArguments) -> anyhow::Result<PathBuf> {
     let context = Context::create();
     let builder = context.create_builder();
-    let module = context.create_module("brainrust");
+    let module_name = arguments
+        .input_filename
+        .file_prefix()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let module = context.create_module(&module_name);
 
     let pass_manager_builder = PassManagerBuilder::create();
     pass_manager_builder.set_optimization_level(OptimizationLevel::Aggressive);
@@ -120,12 +148,43 @@ pub(crate) fn emit(program: &Program) {
     let optimized_module = module_pass_manager.run_on(&module);
     dbg!(optimized_module);
 
-    target_machine
-        .write_to_file(&module, FileType::Assembly, Path::new("test.asm"))
-        .unwrap();
-    target_machine
-        .write_to_file(&module, FileType::Object, Path::new("test.o"))
-        .unwrap();
+    match arguments.emit_target() {
+        EmitTarget::Assembly => {
+            target_machine
+                .write_to_file(&module, FileType::Assembly, &arguments.output_filename())
+                .unwrap();
+            Ok(arguments.output_filename().clone())
+        }
+        EmitTarget::ObjectFile | EmitTarget::Executable => {
+            let object_file_filename = match arguments.only_compile_and_assemble {
+                true => arguments.output_filename(),
+                false => {
+                    let mut result = arguments.output_filename().clone();
+                    result.set_extension(object_file_extension());
+                    result
+                }
+            };
+            target_machine
+                .write_to_file(&module, FileType::Object, &object_file_filename)
+                .map_err(|_| EmitError::FailedToWriteToFile(object_file_filename.clone()))?;
+            Ok(object_file_filename)
+        }
+        EmitTarget::LlvmIr => {
+            std::fs::write(
+                arguments.output_filename(),
+                module.print_to_string().to_str().unwrap(),
+            )?;
+            Ok(arguments.output_filename().clone())
+        }
+    }
+}
 
-    println!("{}", module.print_to_string().to_str().unwrap());
+#[cfg(target_os = "windows")]
+fn object_file_extension() -> &'static str {
+    "obj"
+}
+
+#[cfg(target_os = "linux")]
+fn object_file_extension() -> &'static str {
+    "o"
 }

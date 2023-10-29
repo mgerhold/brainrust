@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.75"
+clap = { version = "4.4.7", features = ["derive"] }
 inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = ["target-all", "llvm16-0"] }
 thiserror = "1.0.50"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
