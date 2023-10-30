@@ -64,6 +64,9 @@ mod state {
                 for i in (difference..self.memory.len()).rev() {
                     self.memory[i] = self.memory[i - 1];
                 }
+                for i in 0..difference {
+                    self.memory[i] = 0;
+                }
             } else if target_index as usize >= self.memory.len() {
                 let difference = target_index as usize - self.memory.len() + 1;
                 self.memory.resize(self.memory.len() + difference, b'\0');
