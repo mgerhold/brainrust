@@ -45,6 +45,7 @@ impl Display for EmitError {
 
 mod state {
     use std::collections::HashMap;
+    use std::fmt::Pointer;
     use std::path::Path;
 
     use inkwell::basic_block::BasicBlock;
@@ -56,11 +57,15 @@ mod state {
     use inkwell::targets::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
     };
-    use inkwell::types::{BasicMetadataTypeEnum, BasicType, IntType, PointerType, VoidType};
+    use inkwell::types::{
+        AnyType, BasicMetadataTypeEnum, BasicType, IntType, PointerType, VoidType,
+    };
     use inkwell::values::{BasicValueEnum, FunctionValue, IntValue};
     use inkwell::{AddressSpace, IntPredicate, OptimizationLevel};
 
+    use crate::emitter::state::FunctionDeclaration::Memset;
     use crate::emitter::EmitError;
+    use crate::program::Statement;
 
     /*macro_rules! get_type {
         ($state:expr, Void) => {
@@ -93,6 +98,14 @@ mod state {
         }};
     }*/
 
+    trait TypeHolder<'a> {
+        fn void(&self) -> VoidType<'a>;
+        fn char(&self) -> IntType<'a>;
+        fn int(&self) -> IntType<'a>;
+        fn size(&self) -> IntType<'a>;
+        fn pointer(&self) -> PointerType<'a>;
+    }
+
     #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
     enum FunctionDeclaration {
         Putchar,
@@ -101,19 +114,54 @@ mod state {
         Free,
         Realloc,
         EnsureSufficientMemoryCapacity,
+        AddressToIndex,
+        Memmove,
+        Memset,
+        MemDump,
+        Printf,
+        Read,
+        Write,
     }
+
+    struct TypeContainer<'a> {
+        void_type: VoidType<'a>,
+        char_type: IntType<'a>,
+        int_type: IntType<'a>,
+        size_type: IntType<'a>,
+        pointer_type: PointerType<'a>,
+    }
+
+    impl<'a> TypeHolder<'a> for TypeContainer<'a> {
+        fn void(&self) -> VoidType<'a> {
+            self.void_type
+        }
+
+        fn char(&self) -> IntType<'a> {
+            self.char_type
+        }
+
+        fn int(&self) -> IntType<'a> {
+            self.int_type
+        }
+
+        fn size(&self) -> IntType<'a> {
+            self.size_type
+        }
+
+        fn pointer(&self) -> PointerType<'a> {
+            self.pointer_type
+        }
+    }
+
+    type Functions<'a> = HashMap<FunctionDeclaration, FunctionValue<'a>>;
 
     pub(super) struct State<'a> {
         pub(super) context: &'a Context,
         pub(super) builder: Builder<'a>,
         pub(super) module: Module<'a>,
         target_machine: TargetMachine,
-        pub(super) void_type: VoidType<'a>,
-        pub(super) char_type: IntType<'a>,
-        pub(super) int_type: IntType<'a>,
-        pub(super) size_type: IntType<'a>,
-        pub(super) pointer_type: PointerType<'a>,
-        declared_functions: HashMap<FunctionDeclaration, FunctionValue<'a>>,
+        types: TypeContainer<'a>,
+        functions: Functions<'a>,
     }
 
     impl<'a> State<'a> {
@@ -142,28 +190,51 @@ mod state {
                 )
                 .unwrap();
 
-            let void_type = context.void_type();
-            let char_type = context.i8_type();
-            let int_type = context.i32_type();
-            let size_type = context.ptr_sized_int_type(&target_machine.get_target_data(), None);
-            let pointer_type = char_type.ptr_type(AddressSpace::default());
+            let types = TypeContainer {
+                void_type: context.void_type(),
+                char_type: context.i8_type(),
+                int_type: context.i32_type(),
+                size_type: context.ptr_sized_int_type(&target_machine.get_target_data(), None),
+                pointer_type: context.i8_type().ptr_type(AddressSpace::default()),
+            };
+
+            let mut functions = HashMap::new();
+
+            Self::declare_libc_functions(&mut functions, &module, &types);
+            Self::generate_function_mem_dump(context, &builder, &mut functions, &module, &types);
+            Self::generate_function_address_to_index(
+                context,
+                &builder,
+                &mut functions,
+                &module,
+                &types,
+            );
+            Self::generate_function_ensure_sufficient_memory_capacity(
+                context,
+                &builder,
+                &mut functions,
+                &module,
+                &types,
+            );
+            Self::generate_function_read(context, &builder, &mut functions, &module, &types);
+            Self::generate_function_write(context, &builder, &mut functions, &module, &types);
+            Self::generate_function_main(context, &builder, &mut functions, &module, &types);
 
             Self {
                 context,
                 builder,
                 module,
                 target_machine,
-                void_type,
-                char_type,
-                int_type,
-                size_type,
-                pointer_type,
-                declared_functions: Default::default(),
+                types,
+                functions,
             }
         }
 
-        fn function(&self, function_declaration: FunctionDeclaration) -> FunctionValue<'a> {
-            *self.declared_functions.get(&function_declaration).unwrap()
+        fn function(
+            function_declaration: FunctionDeclaration,
+            functions: &Functions<'a>,
+        ) -> FunctionValue<'a> {
+            *functions.get(&function_declaration).unwrap()
         }
 
         pub(super) fn module(&self) -> &Module<'a> {
@@ -223,92 +294,392 @@ mod state {
         }
 
         fn create_function(
-            &self,
             name: &str,
             parameter_types: &[BasicMetadataTypeEnum<'a>],
             return_type: Option<&dyn BasicType<'a>>,
             linkage: Option<Linkage>,
+            is_var_args: bool,
+            module: &Module<'a>,
+            type_holder: &dyn TypeHolder<'a>,
         ) -> FunctionValue<'a> {
             let function_type = match return_type {
-                Some(return_type) => return_type.fn_type(parameter_types, false),
-                None => self.void_type.fn_type(parameter_types, false),
+                Some(return_type) => return_type.fn_type(parameter_types, is_var_args),
+                None => type_holder.void().fn_type(parameter_types, is_var_args),
             };
-            self.module.add_function(name, function_type, linkage)
+            module.add_function(name, function_type, linkage)
         }
 
-        pub(super) fn declare_libc_functions(&mut self) {
-            self.declared_functions.insert(
+        pub(super) fn declare_libc_functions(
+            functions: &mut Functions<'a>,
+            module: &Module<'a>,
+            type_holder: &dyn TypeHolder<'a>,
+        ) {
+            functions.insert(
                 FunctionDeclaration::Putchar,
-                self.create_function(
+                Self::create_function(
                     "putchar",
-                    &[self.int_type.into()],
-                    Some(&self.int_type),
+                    &[type_holder.int().into()],
+                    Some(&type_holder.int()),
                     Some(Linkage::External),
+                    false,
+                    &module,
+                    type_holder,
                 ),
             );
 
-            self.declared_functions.insert(
+            functions.insert(
                 FunctionDeclaration::Malloc,
-                self.create_function(
+                Self::create_function(
                     "malloc",
-                    &[self.size_type.into()],
-                    Some(&self.pointer_type),
+                    &[type_holder.size().into()],
+                    Some(&type_holder.pointer()),
                     Some(Linkage::External),
+                    false,
+                    &module,
+                    type_holder,
                 ),
             );
 
-            self.declared_functions.insert(
+            functions.insert(
                 FunctionDeclaration::Free,
-                self.create_function(
+                Self::create_function(
                     "free",
-                    &[self.pointer_type.into()],
+                    &[type_holder.pointer().into()],
                     None,
                     Some(Linkage::External),
+                    false,
+                    &module,
+                    type_holder,
                 ),
             );
 
-            self.declared_functions.insert(
+            functions.insert(
                 FunctionDeclaration::Calloc,
-                self.create_function(
+                Self::create_function(
                     "calloc",
-                    &[self.size_type.into(), self.size_type.into()],
-                    Some(&self.pointer_type),
+                    &[type_holder.size().into(), type_holder.size().into()],
+                    Some(&type_holder.pointer()),
                     Some(Linkage::External),
+                    false,
+                    &module,
+                    type_holder,
                 ),
             );
 
-            self.declared_functions.insert(
+            functions.insert(
                 FunctionDeclaration::Realloc,
-                self.create_function(
+                Self::create_function(
                     "realloc",
-                    &[self.pointer_type.into(), self.size_type.into()],
-                    Some(&self.pointer_type),
+                    &[type_holder.pointer().into(), type_holder.size().into()],
+                    Some(&type_holder.pointer()),
                     Some(Linkage::External),
+                    false,
+                    &module,
+                    type_holder,
+                ),
+            );
+
+            functions.insert(
+                FunctionDeclaration::Memmove,
+                Self::create_function(
+                    "memmove",
+                    &[
+                        type_holder.pointer().into(),
+                        type_holder.pointer().into(),
+                        type_holder.size().into(),
+                    ],
+                    Some(&type_holder.pointer()),
+                    Some(Linkage::External),
+                    false,
+                    &module,
+                    type_holder,
+                ),
+            );
+
+            functions.insert(
+                FunctionDeclaration::Memset,
+                Self::create_function(
+                    "memset",
+                    &[
+                        type_holder.pointer().into(),
+                        type_holder.int().into(),
+                        type_holder.size().into(),
+                    ],
+                    Some(&type_holder.pointer()),
+                    Some(Linkage::External),
+                    false,
+                    &module,
+                    type_holder,
+                ),
+            );
+
+            functions.insert(
+                FunctionDeclaration::Printf,
+                Self::create_function(
+                    "printf",
+                    &[type_holder.pointer().into()],
+                    Some(&type_holder.int()),
+                    Some(Linkage::External),
+                    true,
+                    &module,
+                    type_holder,
                 ),
             );
         }
 
-        pub(super) fn generate_function_ensure_sufficient_memory_capacity(
-            &mut self,
-        ) -> anyhow::Result<(), EmitError> {
-            /* void ensure_sufficient_memory_capacity(
-                    void** memory_ptr_ptr,
-                    size_t* capacity_ptr,
-                    size_t target_capacity
-               )
+        fn generate_function_address_to_index(
+            context: &Context,
+            builder: &Builder<'a>,
+            functions: &mut Functions<'a>,
+            module: &Module<'a>,
+            type_holder: &dyn TypeHolder<'a>,
+        ) {
+            /* int64_t address_to_index(size_t offset, int64_t address) {
+                   return offset + (size_t)address;
+               }
             */
-            let ensure_sufficient_memory_capacity = self.create_function(
-                "ensure_sufficient_memory_capacity",
+            let address_to_index = Self::create_function(
+                "address_to_index",
+                &[type_holder.size().into(), type_holder.size().into()],
+                Some(&type_holder.size()),
+                Some(Linkage::Internal),
+                false,
+                &module,
+                type_holder,
+            );
+
+            functions.insert(FunctionDeclaration::AddressToIndex, address_to_index);
+
+            let offset = address_to_index.get_nth_param(0).unwrap().into_int_value();
+            let address = address_to_index.get_nth_param(1).unwrap().into_int_value();
+
+            let entry = context.append_basic_block(address_to_index, "entry");
+            builder.position_at_end(entry);
+
+            let sum = builder.build_int_add(offset, address, "sum").unwrap();
+
+            builder.build_return(Some(&sum)).unwrap();
+        }
+
+        fn generate_function_write(
+            context: &Context,
+            builder: &Builder<'a>,
+            functions: &mut Functions<'a>,
+            module: &Module<'a>,
+            type_holder: &dyn TypeHolder<'a>,
+        ) {
+            /*
+            void write(
+                size_t address,
+                char value,
+                char** memory_ptr_ptr,
+                size_t* capacity_ptr,
+                size_t* offset_ptr
+            )
+             */
+            let write = Self::create_function(
+                "write",
                 &[
-                    self.pointer_type.into(),
-                    self.pointer_type.into(),
-                    self.size_type.into(),
+                    type_holder.size().into(),
+                    type_holder.char().into(),
+                    type_holder.pointer().into(),
+                    type_holder.pointer().into(),
+                    type_holder.pointer().into(),
                 ],
                 None,
                 Some(Linkage::Internal),
+                false,
+                &module,
+                type_holder,
             );
 
-            self.declared_functions.insert(
+            functions.insert(FunctionDeclaration::Write, write);
+
+            let address = write.get_nth_param(0).unwrap().into_int_value();
+            let value = write.get_nth_param(1).unwrap().into_int_value();
+            let memory_ptr_ptr = write.get_nth_param(2).unwrap().into_pointer_value();
+            let capacity_ptr = write.get_nth_param(3).unwrap().into_pointer_value();
+            let offset_ptr = write.get_nth_param(4).unwrap().into_pointer_value();
+
+            let entry = context.append_basic_block(write, "entry");
+            builder.position_at_end(entry);
+
+            builder
+                .build_direct_call(
+                    Self::function(
+                        FunctionDeclaration::EnsureSufficientMemoryCapacity,
+                        functions,
+                    ),
+                    &[
+                        memory_ptr_ptr.into(),
+                        capacity_ptr.into(),
+                        offset_ptr.into(),
+                        address.into(),
+                    ],
+                    "",
+                )
+                .unwrap();
+
+            let index = builder
+                .build_direct_call(
+                    Self::function(FunctionDeclaration::AddressToIndex, functions),
+                    &[
+                        address.into(),
+                        builder
+                            .build_load(type_holder.size(), offset_ptr, "offset")
+                            .unwrap()
+                            .into_int_value()
+                            .into(),
+                    ],
+                    "index",
+                )
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_int_value();
+
+            let memory_address = unsafe {
+                builder.build_gep(
+                    type_holder.char(),
+                    builder
+                        .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_ptr")
+                        .unwrap()
+                        .into_pointer_value(),
+                    &[index],
+                    "memory_address",
+                )
+            }
+            .unwrap();
+
+            builder.build_store(memory_address, value).unwrap();
+
+            builder.build_return(None).unwrap();
+        }
+
+        fn generate_function_read(
+            context: &Context,
+            builder: &Builder<'a>,
+            functions: &mut Functions<'a>,
+            module: &Module<'a>,
+            type_holder: &dyn TypeHolder<'a>,
+        ) {
+            /*
+            char read(
+                size_t address,
+                char** memory_ptr_ptr,
+                size_t* capacity_ptr,
+                size_t* offset_ptr
+            )
+             */
+            let read = Self::create_function(
+                "read",
+                &[
+                    type_holder.size().into(),
+                    type_holder.pointer().into(),
+                    type_holder.pointer().into(),
+                    type_holder.pointer().into(),
+                ],
+                Some(&type_holder.char()),
+                Some(Linkage::Internal),
+                false,
+                &module,
+                type_holder,
+            );
+
+            functions.insert(FunctionDeclaration::Read, read);
+
+            let address = read.get_nth_param(0).unwrap().into_int_value();
+            let memory_ptr_ptr = read.get_nth_param(1).unwrap().into_pointer_value();
+            let capacity_ptr = read.get_nth_param(2).unwrap().into_pointer_value();
+            let offset_ptr = read.get_nth_param(3).unwrap().into_pointer_value();
+
+            let entry = context.append_basic_block(read, "entry");
+            builder.position_at_end(entry);
+
+            builder
+                .build_direct_call(
+                    Self::function(
+                        FunctionDeclaration::EnsureSufficientMemoryCapacity,
+                        functions,
+                    ),
+                    &[
+                        memory_ptr_ptr.into(),
+                        capacity_ptr.into(),
+                        offset_ptr.into(),
+                        address.into(),
+                    ],
+                    "",
+                )
+                .unwrap();
+
+            let index = builder
+                .build_direct_call(
+                    Self::function(FunctionDeclaration::AddressToIndex, functions),
+                    &[
+                        address.into(),
+                        builder
+                            .build_load(type_holder.size(), offset_ptr, "offset")
+                            .unwrap()
+                            .into_int_value()
+                            .into(),
+                    ],
+                    "index",
+                )
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_int_value();
+
+            let memory_address = unsafe {
+                builder.build_gep(
+                    type_holder.char(),
+                    builder
+                        .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_ptr")
+                        .unwrap()
+                        .into_pointer_value(),
+                    &[index],
+                    "memory_address",
+                )
+            }
+            .unwrap();
+
+            let result = builder
+                .build_load(type_holder.char(), memory_address, "result")
+                .unwrap();
+
+            builder.build_return(Some(&result)).unwrap();
+        }
+
+        fn generate_function_ensure_sufficient_memory_capacity(
+            context: &Context,
+            builder: &Builder<'a>,
+            functions: &mut Functions<'a>,
+            module: &Module<'a>,
+            type_holder: &dyn TypeHolder<'a>,
+        ) {
+            /* void ensure_sufficient_memory_capacity(
+                    char** memory_ptr_ptr,
+                    size_t* capacity_ptr,
+                    size_t* offset_ptr,
+                    int64_t address
+               )
+            */
+            let ensure_sufficient_memory_capacity = Self::create_function(
+                "ensure_sufficient_memory_capacity",
+                &[
+                    type_holder.pointer().into(), // memory_ptr_ptr
+                    type_holder.pointer().into(), // capacity_ptr
+                    type_holder.pointer().into(), // offset_ptr
+                    type_holder.size().into(),    // address
+                ],
+                None,
+                Some(Linkage::Internal),
+                false,
+                &module,
+                type_holder,
+            );
+
+            functions.insert(
                 FunctionDeclaration::EnsureSufficientMemoryCapacity,
                 ensure_sufficient_memory_capacity,
             );
@@ -321,216 +692,609 @@ mod state {
                 .get_nth_param(1)
                 .unwrap()
                 .into_pointer_value();
-            let target_capacity = ensure_sufficient_memory_capacity
+            let offset_ptr = ensure_sufficient_memory_capacity
                 .get_nth_param(2)
                 .unwrap()
-                .into_int_value();
-
-            let entry = self
-                .context
-                .append_basic_block(ensure_sufficient_memory_capacity, "entry");
-            self.builder.position_at_end(entry);
-
-            let capacity = self
-                .builder
-                .build_load(self.size_type, capacity_ptr, "capacity")
+                .into_pointer_value();
+            let address = ensure_sufficient_memory_capacity
+                .get_nth_param(3)
                 .unwrap()
                 .into_int_value();
 
-            let must_grow = self
-                .builder
-                .build_int_compare(IntPredicate::UGT, target_capacity, capacity, "must_grow")
-                .unwrap();
+            let entry = context.append_basic_block(ensure_sufficient_memory_capacity, "entry");
+            builder.position_at_end(entry);
 
-            let new_capacity = self
-                .builder
-                .build_alloca(self.size_type, "new_capacity")
-                .unwrap();
-            self.branch(
-                must_grow,
-                |after_branch| {
-                    let capacity_is_zero = self
-                        .builder
-                        .build_int_compare(
-                            IntPredicate::EQ,
-                            capacity,
-                            self.size_type.const_zero(),
-                            "capacity_is_zero",
-                        )
-                        .unwrap();
-
-                    self.branch(
-                        capacity_is_zero,
-                        |after_branch| {
-                            self.builder
-                                .build_store(new_capacity, self.size_type.const_int(1, false))
-                                .unwrap();
-                            self.builder
-                                .build_unconditional_branch(after_branch)
-                                .unwrap();
-                        },
-                        |after_branch| {
-                            self.builder
-                                .build_store(
-                                    new_capacity,
-                                    self.builder
-                                        .build_int_mul(
-                                            capacity,
-                                            self.size_type.const_int(2, false),
-                                            "new_capacity",
-                                        )
-                                        .unwrap(),
-                                )
-                                .unwrap();
-                            self.builder
-                                .build_unconditional_branch(after_branch)
-                                .unwrap();
-                        },
-                    );
-                    self.builder
-                        .build_unconditional_branch(after_branch)
-                        .unwrap();
-                },
-                |_| {
-                    self.builder.build_return(None).unwrap();
-                },
-            );
-            let memory_ptr = self
-                .builder
-                .build_load(self.pointer_type, memory_ptr_ptr, "memory_ptr")
-                .unwrap();
-            let new_memory_ptr = self
-                .builder
+            let index = builder
                 .build_direct_call(
-                    self.function(FunctionDeclaration::Realloc).into(),
+                    Self::function(FunctionDeclaration::AddressToIndex, functions),
                     &[
-                        memory_ptr.into(),
-                        self.builder
-                            .build_load(self.size_type, new_capacity, "new_capacity_value")
+                        builder
+                            .build_load(type_holder.size(), offset_ptr, "offset")
                             .unwrap()
                             .into(),
+                        address.into(),
                     ],
-                    "new_memory_ptr",
+                    "index",
                 )
                 .unwrap()
                 .try_as_basic_value()
                 .unwrap_left()
-                .into_pointer_value();
-            self.builder
-                .build_store(memory_ptr_ptr, new_memory_ptr)
-                .unwrap();
-            self.builder
-                .build_store(
-                    capacity_ptr,
-                    self.builder
-                        .build_load(self.size_type, new_capacity, "new_capacity_value")
-                        .unwrap(),
+                .into_int_value();
+
+            let is_index_negative = builder
+                .build_int_compare(
+                    IntPredicate::SLT,
+                    index,
+                    type_holder.size().const_zero(),
+                    "is_index_negative",
                 )
                 .unwrap();
-            self.builder.build_return(None).unwrap();
-            Ok(())
+
+            Self::branch(
+                context,
+                builder,
+                is_index_negative,
+                |after_branch| {
+                    // the index is negative
+
+                    // size_t difference = (size_t)(-index);
+                    let difference = builder.build_int_neg(index, "difference").unwrap();
+                    // (*offset) += difference;
+                    builder
+                        .build_store(
+                            offset_ptr,
+                            builder
+                                .build_int_add(
+                                    builder
+                                        .build_load(type_holder.size(), offset_ptr, "offset")
+                                        .unwrap()
+                                        .into_int_value(),
+                                    difference,
+                                    "new_offset",
+                                )
+                                .unwrap(),
+                        )
+                        .unwrap();
+
+                    // size_t new_capacity = *capacity_ptr + difference;
+                    let new_capacity = builder
+                        .build_int_add(
+                            builder
+                                .build_load(type_holder.size(), capacity_ptr, "capacity")
+                                .unwrap()
+                                .into_int_value(),
+                            difference,
+                            "new_capacity",
+                        )
+                        .unwrap();
+
+                    // char* new_memory_ptr = malloc(*memory_ptr_ptr, new_capacity);
+                    let new_memory_ptr = builder
+                        .build_direct_call(
+                            Self::function(FunctionDeclaration::Realloc, functions),
+                            &[
+                                builder
+                                    .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_ptr")
+                                    .unwrap()
+                                    .into_pointer_value()
+                                    .into(),
+                                new_capacity.into(),
+                            ],
+                            "new_memory_ptr",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_left()
+                        .into_pointer_value();
+
+                    // char* dest = &new_memory_ptr[difference];
+                    let dest = unsafe {
+                        builder
+                            .build_gep(type_holder.char(), new_memory_ptr, &[difference], "dest")
+                            .unwrap()
+                    };
+
+                    // memmove(dest, new_memory_ptr, *capacity_ptr)
+                    builder
+                        .build_direct_call(
+                            Self::function(FunctionDeclaration::Memmove, functions),
+                            &[
+                                dest.into(),
+                                new_memory_ptr.into(),
+                                builder
+                                    .build_load(type_holder.size(), capacity_ptr, "capacity")
+                                    .unwrap()
+                                    .into(),
+                            ],
+                            "",
+                        )
+                        .unwrap();
+
+                    // memset(new_memory_ptr, 0, difference)
+                    builder
+                        .build_direct_call(
+                            Self::function(Memset, functions),
+                            &[
+                                new_memory_ptr.into(),
+                                //type_holder.int().const_zero().into(),
+                                type_holder.int().const_int(2, false).into(),
+                                difference.into(),
+                            ],
+                            "",
+                        )
+                        .unwrap();
+
+                    // *capacity_ptr = new_capacity;
+                    builder.build_store(capacity_ptr, new_capacity).unwrap();
+
+                    // *memory_ptr_ptr = new_memory_ptr;
+                    builder.build_store(memory_ptr_ptr, new_memory_ptr).unwrap();
+
+                    builder.build_unconditional_branch(after_branch).unwrap();
+                },
+                |after_branch| {
+                    let index_is_greater_than_or_equal_to_capacity = builder
+                        .build_int_compare(
+                            IntPredicate::UGE,
+                            index,
+                            builder
+                                .build_load(type_holder.size(), capacity_ptr, "capacity")
+                                .unwrap()
+                                .into_int_value(),
+                            "index_is_greater_than_or_equal_to_capacity",
+                        )
+                        .unwrap();
+
+                    Self::branch(
+                        context,
+                        builder,
+                        index_is_greater_than_or_equal_to_capacity,
+                        |after_branch| {
+                            // size_t new_capacity = index + 1;
+                            let new_capacity = builder
+                                .build_int_add(
+                                    index,
+                                    type_holder.size().const_int(1, false),
+                                    "new_capacity",
+                                )
+                                .unwrap();
+
+                            // char* new_memory_ptr = realloc(memory_ptr, new_capacity);
+                            let new_memory_ptr = builder
+                                .build_direct_call(
+                                    Self::function(FunctionDeclaration::Realloc, functions),
+                                    &[
+                                        builder
+                                            .build_load(
+                                                type_holder.pointer(),
+                                                memory_ptr_ptr,
+                                                "memory_ptr",
+                                            )
+                                            .unwrap()
+                                            .into_pointer_value()
+                                            .into(),
+                                        new_capacity.into(),
+                                    ],
+                                    "new_memory_ptr",
+                                )
+                                .unwrap()
+                                .try_as_basic_value()
+                                .unwrap_left()
+                                .into_pointer_value();
+
+                            // size_t difference = new_capacity - capacity;
+                            let difference = builder
+                                .build_int_sub(
+                                    new_capacity,
+                                    builder
+                                        .build_load(type_holder.size(), capacity_ptr, "capacity")
+                                        .unwrap()
+                                        .into_int_value(),
+                                    "difference",
+                                )
+                                .unwrap();
+
+                            // char* dest = &new_memory_ptr[*capacity_ptr];
+                            let dest = unsafe {
+                                builder
+                                    .build_gep(
+                                        type_holder.char(),
+                                        new_memory_ptr,
+                                        &[builder
+                                            .build_load(
+                                                type_holder.size(),
+                                                capacity_ptr,
+                                                "capacity",
+                                            )
+                                            .unwrap()
+                                            .into_int_value()],
+                                        "dest",
+                                    )
+                                    .unwrap()
+                            };
+
+                            // memset(dest, 0, difference);
+                            builder
+                                .build_direct_call(
+                                    Self::function(FunctionDeclaration::Memset, functions),
+                                    &[
+                                        dest.into(),
+                                        //type_holder.int().const_zero().into(),
+                                        type_holder.int().const_int(1, false).into(),
+                                        difference.into(),
+                                    ],
+                                    "",
+                                )
+                                .unwrap();
+
+                            // *memory_ptr_ptr = new_memory_ptr;
+                            builder.build_store(memory_ptr_ptr, new_memory_ptr).unwrap();
+
+                            // *capacity_ptr = new_capacity;
+                            builder.build_store(capacity_ptr, new_capacity).unwrap();
+
+                            builder.build_unconditional_branch(after_branch).unwrap();
+                        },
+                        |_| {
+                            builder.build_return(None).unwrap();
+                        },
+                    );
+
+                    builder.build_unconditional_branch(after_branch).unwrap();
+                },
+            );
+
+            builder.build_return(None).unwrap();
         }
 
-        pub(super) fn generate_function_main(&self) -> anyhow::Result<(), EmitError> {
-            let main =
-                self.create_function("main", &[], Some(&self.int_type), Some(Linkage::External));
+        fn generate_function_mem_dump(
+            context: &Context,
+            builder: &Builder<'a>,
+            functions: &mut Functions<'a>,
+            module: &Module<'a>,
+            type_holder: &dyn TypeHolder<'a>,
+        ) {
+            let mem_dump = Self::create_function(
+                "mem_dump",
+                &[type_holder.pointer().into(), type_holder.size().into()],
+                None,
+                Some(Linkage::Internal),
+                false,
+                module,
+                type_holder,
+            );
 
-            let entry = self.context.append_basic_block(main, "entry");
-            self.builder.position_at_end(entry);
+            functions.insert(FunctionDeclaration::MemDump, mem_dump);
 
-            let memory = self
-                .builder
-                .build_alloca(self.pointer_type, "memory")
-                .unwrap();
-            self.builder
-                .build_store(memory, self.pointer_type.const_zero())
+            let memory_ptr = mem_dump.get_nth_param(0).unwrap().into_pointer_value();
+            let capacity = mem_dump.get_nth_param(1).unwrap().into_int_value();
+
+            let entry = context.append_basic_block(mem_dump, "entry");
+            let loop_start = context.append_basic_block(mem_dump, "loop_start");
+            let loop_body = context.append_basic_block(mem_dump, "loop_body");
+            let after_loop = context.append_basic_block(mem_dump, "after_loop");
+            builder.position_at_end(entry);
+
+            /*let capacity_format_string = unsafe {
+                builder
+                    .build_global_string("capacity: %d\n", "capacity_format_string")
+                    .unwrap()
+            };
+
+            builder
+                .build_direct_call(
+                    Self::function(FunctionDeclaration::Printf),
+                    &[
+                        capacity_format_string.as_pointer_value().into(),
+                        capacity.into(),
+                    ],
+                    "",
+                )
+                .unwrap();*/
+
+            builder
+                .build_direct_call(
+                    Self::function(FunctionDeclaration::Putchar, functions),
+                    &[type_holder.int().const_int(77, false).into()],
+                    "",
+                )
                 .unwrap();
 
-            let size = self.builder.build_alloca(self.size_type, "size").unwrap();
-            self.builder
-                .build_store(size, self.size_type.const_zero())
+            builder
+                .build_direct_call(
+                    Self::function(FunctionDeclaration::Putchar, functions),
+                    &[type_holder.int().const_int(58, false).into()],
+                    "",
+                )
                 .unwrap();
 
-            let capacity = self
-                .builder
-                .build_alloca(self.size_type, "capacity")
-                .unwrap();
-            self.builder
-                .build_store(capacity, self.size_type.const_zero())
+            let i_ptr = builder.build_alloca(type_holder.size(), "i").unwrap();
+            builder
+                .build_store(i_ptr, type_holder.size().const_zero())
                 .unwrap();
 
-            /* void ensure_sufficient_memory_capacity(
-                    void** memory_ptr_ptr,
-                    size_t* capacity_ptr,
-                    size_t target_capacity
-               )
-            */
-            for _ in 0..40 {
-                self.builder
-                    .build_direct_call(
-                        self.function(FunctionDeclaration::EnsureSufficientMemoryCapacity)
+            builder.build_unconditional_branch(loop_start).unwrap();
+
+            builder.position_at_end(loop_start);
+
+            /*let i_format_string = unsafe {
+                builder
+                    .build_global_string("i = %d\n", "i_format_string")
+                    .unwrap()
+            };
+
+            builder
+                .build_direct_call(
+                    Self::function(FunctionDeclaration::Printf),
+                    &[
+                        i_format_string.as_pointer_value().into(),
+                        builder
+                            .build_load(type_holder.size(), i_ptr, "i")
+                            .unwrap()
                             .into(),
+                    ],
+                    "",
+                )
+                .unwrap();*/
+
+            let i_is_less_than_capacity = builder
+                .build_int_compare(
+                    IntPredicate::ULT,
+                    builder
+                        .build_load(type_holder.size(), i_ptr, "i")
+                        .unwrap()
+                        .into_int_value(),
+                    capacity,
+                    "i_is_less_than_capacity",
+                )
+                .unwrap();
+
+            Self::branch(
+                context,
+                builder,
+                i_is_less_than_capacity,
+                |after_branch| {
+                    builder.build_unconditional_branch(after_branch).unwrap();
+                },
+                |_| {
+                    builder.build_return(None).unwrap();
+                },
+            );
+            builder.build_unconditional_branch(loop_body).unwrap();
+
+            builder.position_at_end(loop_body);
+            // char* address = &memory_ptr[i]
+            let address = unsafe {
+                builder
+                    .build_gep(
+                        type_holder.char(),
+                        memory_ptr,
+                        &[builder
+                            .build_load(type_holder.size(), i_ptr, "i")
+                            .unwrap()
+                            .into_int_value()],
+                        "address",
+                    )
+                    .unwrap()
+            };
+            let value = builder
+                .build_load(type_holder.char(), address, "value")
+                .unwrap()
+                .into_int_value();
+
+            let printable_value = builder
+                .build_int_add(
+                    value,
+                    type_holder.char().const_int(48, false),
+                    "printable_value",
+                )
+                .unwrap();
+
+            let printable_value_int = builder
+                .build_int_cast(printable_value, type_holder.int(), "printable_value_int")
+                .unwrap();
+
+            builder
+                .build_direct_call(
+                    Self::function(FunctionDeclaration::Putchar, functions),
+                    &[printable_value_int.into()],
+                    "",
+                )
+                .unwrap();
+            let new_i = builder
+                .build_int_add(
+                    builder
+                        .build_load(type_holder.size(), i_ptr, "i")
+                        .unwrap()
+                        .into_int_value(),
+                    type_holder.size().const_int(1, false),
+                    "new_i",
+                )
+                .unwrap();
+            builder.build_store(i_ptr, new_i).unwrap();
+            builder.build_unconditional_branch(loop_start).unwrap();
+
+            builder.position_at_end(after_loop);
+            builder
+                .build_direct_call(
+                    Self::function(FunctionDeclaration::Putchar, functions),
+                    &[type_holder.int().const_int(10, false).into()],
+                    "",
+                )
+                .unwrap();
+            builder.build_return(None).unwrap();
+            /*
+            entry:
+                size_t i = 0;
+                goto loop_start;
+            loop_start:
+                if (i < capacity) {
+                    goto loop_body;
+                } else {
+                    goto after_loop;
+                }
+            loop_body:
+                putchar(memory_ptr[i]);
+                ++i;
+                goto loop_start;
+            after_loop:
+                putchar('\n');
+            */
+        }
+
+        fn generate_function_main(
+            context: &Context,
+            builder: &Builder<'a>,
+            functions: &mut Functions<'a>,
+            module: &Module<'a>,
+            type_holder: &dyn TypeHolder<'a>,
+        ) {
+            let main = Self::create_function(
+                "main",
+                &[],
+                Some(&type_holder.int()),
+                Some(Linkage::External),
+                false,
+                &module,
+                type_holder,
+            );
+
+            let entry = context.append_basic_block(main, "entry");
+            builder.position_at_end(entry);
+
+            let memory_ptr_ptr = builder
+                .build_alloca(type_holder.pointer(), "memory")
+                .unwrap();
+            builder
+                .build_store(memory_ptr_ptr, type_holder.pointer().const_zero())
+                .unwrap();
+
+            let capacity_ptr = builder
+                .build_alloca(type_holder.size(), "capacity")
+                .unwrap();
+            builder
+                .build_store(capacity_ptr, type_holder.size().const_zero())
+                .unwrap();
+
+            let offset_ptr = builder.build_alloca(type_holder.size(), "offset").unwrap();
+            builder
+                .build_store(offset_ptr, type_holder.size().const_zero())
+                .unwrap();
+
+            let address_ptr = builder.build_alloca(type_holder.size(), "address").unwrap();
+            builder
+                .build_store(address_ptr, type_holder.size().const_zero())
+                .unwrap();
+
+            /*let ensure_address = |index: i64| {
+                builder
+                    .build_direct_call(
+                        Self::function(
+                            FunctionDeclaration::EnsureSufficientMemoryCapacity,
+                            functions,
+                        ),
                         &[
-                            memory.into(),
-                            capacity.into(),
-                            self.size_type.const_int(1000000, false).into(),
+                            memory_ptr_ptr.into(),
+                            capacity_ptr.into(),
+                            offset_ptr.into(),
+                            if index < 0 {
+                                builder
+                                    .build_int_neg(
+                                        type_holder.size().const_int((-index) as u64, false),
+                                        "",
+                                    )
+                                    .unwrap()
+                                    .into()
+                            } else {
+                                type_holder.size().const_int(index as u64, false).into()
+                            },
                         ],
                         "",
                     )
-                    .unwrap();
-            }
+                    .unwrap()
+            };
 
-            self.builder
+            ensure_address(0);
+            ensure_address(5);
+            ensure_address(-20);
+            ensure_address(15);
+            ensure_address(-60);
+            ensure_address(200);
+            ensure_address(10);
+            ensure_address(-8);
+            ensure_address(1024);*/
+
+            // mem_dump()
+            builder
                 .build_direct_call(
-                    self.function(FunctionDeclaration::Free).into(),
-                    &[self
-                        .builder
-                        .build_load(self.pointer_type, memory, "memory_address")
-                        .unwrap()
-                        .into()],
-                    "free_result",
+                    Self::function(FunctionDeclaration::MemDump, functions),
+                    &[
+                        builder
+                            .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_ptr")
+                            .unwrap()
+                            .into_pointer_value()
+                            .into(),
+                        builder
+                            .build_load(type_holder.size(), capacity_ptr, "capacity")
+                            .unwrap()
+                            .into_int_value()
+                            .into(),
+                    ],
+                    "",
                 )
                 .unwrap();
 
-            self.builder
-                .build_return(Some(&self.int_type.const_zero()))
+            builder
+                .build_direct_call(
+                    Self::function(FunctionDeclaration::Free, functions),
+                    &[builder
+                        .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_address")
+                        .unwrap()
+                        .into()],
+                    "",
+                )
                 .unwrap();
 
-            Ok(())
+            builder
+                .build_return(Some(&type_holder.int().const_zero()))
+                .unwrap();
         }
 
         fn branch<ThenEmitter: FnOnce(BasicBlock), ElseEmitter: FnOnce(BasicBlock)>(
-            &self,
+            context: &Context,
+            builder: &Builder<'a>,
             condition: IntValue<'a>,
             then_emitter: ThenEmitter,
             else_emitter: ElseEmitter,
         ) {
-            let surrounding_function = self
-                .builder
-                .get_insert_block()
-                .unwrap()
-                .get_parent()
-                .unwrap();
-            let then_block = self
-                .context
-                .append_basic_block(surrounding_function, "then");
-            let else_block = self
-                .context
-                .append_basic_block(surrounding_function, "else");
-            let after_branch_block = self
-                .context
-                .append_basic_block(surrounding_function, "after_branch");
-            self.builder
+            let surrounding_function = builder.get_insert_block().unwrap().get_parent().unwrap();
+            let then_block = context.append_basic_block(surrounding_function, "then");
+            let else_block = context.append_basic_block(surrounding_function, "else");
+            let after_branch_block =
+                context.append_basic_block(surrounding_function, "after_branch");
+            builder
                 .build_conditional_branch(condition, then_block, else_block)
                 .unwrap();
 
-            self.builder.position_at_end(then_block);
+            builder.position_at_end(then_block);
             then_emitter(after_branch_block);
 
-            self.builder.position_at_end(else_block);
+            builder.position_at_end(else_block);
             else_emitter(after_branch_block);
 
-            self.builder.position_at_end(after_branch_block);
+            builder.position_at_end(after_branch_block);
+        }
+
+        pub(super) fn emit_code_for_statement(&self, statement: &Statement) {
+            match statement {
+                Statement::IncrementPointer => {}
+                Statement::DecrementPointer => {}
+                Statement::IncrementValue => {}
+                Statement::DecrementValue => {}
+                Statement::PutChar => {}
+                Statement::GetChar => {}
+                Statement::Loop(_) => {}
+            }
         }
     }
 }
@@ -545,9 +1309,8 @@ pub(crate) fn emit(program: &Program, arguments: &CommandLineArguments) -> anyho
 
     let context = Context::create();
     let mut state = State::new(&context, &module_name);
-    state.declare_libc_functions();
-    state.generate_function_ensure_sufficient_memory_capacity()?;
-    state.generate_function_main()?;
+
+    for statement in program.statements() {}
 
     state.verify()?;
 
