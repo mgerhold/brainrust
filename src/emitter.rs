@@ -45,7 +45,6 @@ impl Display for EmitError {
 
 mod state {
     use std::collections::HashMap;
-    use std::fmt::Pointer;
     use std::path::Path;
 
     use inkwell::basic_block::BasicBlock;
@@ -60,12 +59,14 @@ mod state {
     use inkwell::types::{
         AnyType, BasicMetadataTypeEnum, BasicType, IntType, PointerType, VoidType,
     };
-    use inkwell::values::{BasicValueEnum, FunctionValue, IntValue};
+    use inkwell::values::{
+        BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+    };
     use inkwell::{AddressSpace, IntPredicate, OptimizationLevel};
 
     use crate::emitter::state::FunctionDeclaration::Memset;
     use crate::emitter::EmitError;
-    use crate::program::Statement;
+    use crate::program::{Program, Statement};
 
     /*macro_rules! get_type {
         ($state:expr, Void) => {
@@ -155,6 +156,13 @@ mod state {
 
     type Functions<'a> = HashMap<FunctionDeclaration, FunctionValue<'a>>;
 
+    struct RuntimeValues<'a> {
+        address_ptr: PointerValue<'a>,
+        memory_ptr_ptr: PointerValue<'a>,
+        capacity_ptr: PointerValue<'a>,
+        offset_ptr: PointerValue<'a>,
+    }
+
     pub(super) struct State<'a> {
         pub(super) context: &'a Context,
         pub(super) builder: Builder<'a>,
@@ -165,7 +173,7 @@ mod state {
     }
 
     impl<'a> State<'a> {
-        pub(super) fn new(context: &'a Context, module_name: &str) -> Self {
+        pub(super) fn new(context: &'a Context, module_name: &str, program: &Program) -> Self {
             let builder = context.create_builder();
             let module = context.create_module(module_name);
 
@@ -218,7 +226,33 @@ mod state {
             );
             Self::generate_function_read(context, &builder, &mut functions, &module, &types);
             Self::generate_function_write(context, &builder, &mut functions, &module, &types);
-            Self::generate_function_main(context, &builder, &mut functions, &module, &types);
+
+            let run = Self::create_function(
+                "run",
+                &[
+                    types.pointer().into(), // address_ptr (size_t*)
+                    types.pointer().into(), // memory_ptr_ptr (char**)
+                    types.pointer().into(), // capacity_ptr (size_t*)
+                    types.pointer().into(), // offset_ptr (size_t*)
+                ],
+                None,
+                Some(Linkage::Internal),
+                false,
+                &module,
+                &types,
+            );
+            let first_block = context.append_basic_block(run, "block");
+            builder.position_at_end(first_block);
+            for statement in program.statements() {
+                let next_block = context.append_basic_block(run, "block");
+                Self::emit_code_for_statement(
+                    statement, next_block, context, &builder, &functions, &module, &types,
+                );
+                builder.position_at_end(next_block);
+            }
+            builder.build_return(None).unwrap();
+
+            Self::generate_function_main(run, context, &builder, &mut functions, &module, &types);
 
             Self {
                 context,
@@ -309,7 +343,7 @@ mod state {
             module.add_function(name, function_type, linkage)
         }
 
-        pub(super) fn declare_libc_functions(
+        fn declare_libc_functions(
             functions: &mut Functions<'a>,
             module: &Module<'a>,
             type_holder: &dyn TypeHolder<'a>,
@@ -470,7 +504,7 @@ mod state {
         ) {
             /*
             void write(
-                size_t address,
+                int64_t address,
                 char value,
                 char** memory_ptr_ptr,
                 size_t* capacity_ptr,
@@ -489,7 +523,7 @@ mod state {
                 None,
                 Some(Linkage::Internal),
                 false,
-                &module,
+                module,
                 type_holder,
             );
 
@@ -565,7 +599,7 @@ mod state {
         ) {
             /*
             char read(
-                size_t address,
+                int64_t address,
                 char** memory_ptr_ptr,
                 size_t* capacity_ptr,
                 size_t* offset_ptr
@@ -582,7 +616,7 @@ mod state {
                 Some(&type_holder.char()),
                 Some(Linkage::Internal),
                 false,
-                &module,
+                module,
                 type_holder,
             );
 
@@ -595,6 +629,34 @@ mod state {
 
             let entry = context.append_basic_block(read, "entry");
             builder.position_at_end(entry);
+
+            Self::generate_printf("inside 'read'\n", &[], builder, functions);
+            Self::generate_printf(
+                "memory_ptr: %p\n",
+                &[builder
+                    .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_ptr")
+                    .unwrap()
+                    .into()],
+                builder,
+                functions,
+            );
+            Self::generate_printf("address: %zu\n", &[address.into()], builder, functions);
+
+            builder
+                .build_direct_call(
+                    Self::function(
+                        FunctionDeclaration::EnsureSufficientMemoryCapacity,
+                        functions,
+                    ),
+                    &[
+                        memory_ptr_ptr.into(),
+                        capacity_ptr.into(),
+                        offset_ptr.into(),
+                        address.into(),
+                    ],
+                    "",
+                )
+                .unwrap();
 
             builder
                 .build_direct_call(
@@ -704,6 +766,23 @@ mod state {
             let entry = context.append_basic_block(ensure_sufficient_memory_capacity, "entry");
             builder.position_at_end(entry);
 
+            Self::generate_printf(
+                "inside 'ensure_sufficient_memory_capacity'\n",
+                &[],
+                builder,
+                functions,
+            );
+            Self::generate_printf(
+                "memory_ptr: %p\n",
+                &[builder
+                    .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_ptr")
+                    .unwrap()
+                    .into()],
+                builder,
+                functions,
+            );
+            Self::generate_printf("address: %zu\n", &[address.into()], builder, functions);
+
             let index = builder
                 .build_direct_call(
                     Self::function(FunctionDeclaration::AddressToIndex, functions),
@@ -720,6 +799,13 @@ mod state {
                 .try_as_basic_value()
                 .unwrap_left()
                 .into_int_value();
+
+            Self::generate_printf(
+                "  calculated index: %zu\n",
+                &[index.into()],
+                builder,
+                functions,
+            );
 
             let is_index_negative = builder
                 .build_int_compare(
@@ -816,8 +902,7 @@ mod state {
                             Self::function(Memset, functions),
                             &[
                                 new_memory_ptr.into(),
-                                //type_holder.int().const_zero().into(),
-                                type_holder.int().const_int(2, false).into(),
+                                type_holder.int().const_int(0, false).into(),
                                 difference.into(),
                             ],
                             "",
@@ -850,6 +935,16 @@ mod state {
                         builder,
                         index_is_greater_than_or_equal_to_capacity,
                         |after_branch| {
+                            Self::generate_printf(
+                                "  index is greater than or equal to capacity (capacity = %zu)\n",
+                                &[builder
+                                    .build_load(type_holder.size(), capacity_ptr, "capacity")
+                                    .unwrap()
+                                    .into_int_value()
+                                    .into()],
+                                builder,
+                                functions,
+                            );
                             // size_t new_capacity = index + 1;
                             let new_capacity = builder
                                 .build_int_add(
@@ -881,6 +976,13 @@ mod state {
                                 .try_as_basic_value()
                                 .unwrap_left()
                                 .into_pointer_value();
+
+                            Self::generate_printf(
+                                "  new memory pointer = %p\n",
+                                &[new_memory_ptr.into()],
+                                builder,
+                                functions,
+                            );
 
                             // size_t difference = new_capacity - capacity;
                             let difference = builder
@@ -919,19 +1021,47 @@ mod state {
                                     Self::function(FunctionDeclaration::Memset, functions),
                                     &[
                                         dest.into(),
-                                        //type_holder.int().const_zero().into(),
-                                        type_holder.int().const_int(1, false).into(),
+                                        type_holder.int().const_int(0, false).into(),
                                         difference.into(),
                                     ],
                                     "",
                                 )
                                 .unwrap();
 
+                            Self::generate_printf(
+                                "  new memory pointer = %p\n",
+                                &[new_memory_ptr.into()],
+                                builder,
+                                functions,
+                            );
+
                             // *memory_ptr_ptr = new_memory_ptr;
                             builder.build_store(memory_ptr_ptr, new_memory_ptr).unwrap();
 
+                            Self::generate_printf(
+                                "  stored %p in memory pointer\n",
+                                &[builder
+                                    .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_ptr")
+                                    .unwrap()
+                                    .into_pointer_value()
+                                    .into()],
+                                builder,
+                                functions,
+                            );
+
                             // *capacity_ptr = new_capacity;
                             builder.build_store(capacity_ptr, new_capacity).unwrap();
+
+                            Self::generate_printf(
+                                "  stored %p in memory pointer\n",
+                                &[builder
+                                    .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_ptr")
+                                    .unwrap()
+                                    .into_pointer_value()
+                                    .into()],
+                                builder,
+                                functions,
+                            );
 
                             builder.build_unconditional_branch(after_branch).unwrap();
                         },
@@ -974,6 +1104,9 @@ mod state {
             let loop_body = context.append_basic_block(mem_dump, "loop_body");
             let after_loop = context.append_basic_block(mem_dump, "after_loop");
             builder.position_at_end(entry);
+
+            Self::generate_printf("inside 'mem_dump'\n", &[], builder, functions);
+            Self::generate_printf("memory_ptr: %p\n", &[memory_ptr.into()], builder, functions);
 
             /*let capacity_format_string = unsafe {
                 builder
@@ -1142,7 +1275,29 @@ mod state {
             */
         }
 
+        fn generate_printf(
+            format_string: &str,
+            args: &[BasicMetadataValueEnum],
+            builder: &Builder<'a>,
+            functions: &Functions<'a>,
+        ) {
+            /*let string = unsafe {
+                builder
+                    .build_global_string(format_string, "string")
+                    .unwrap()
+            };
+            let first: &[BasicMetadataValueEnum] = &[string.as_pointer_value().into()];
+            builder
+                .build_direct_call(
+                    Self::function(FunctionDeclaration::Printf, functions),
+                    &[first, args].concat(),
+                    "",
+                )
+                .unwrap();*/
+        }
+
         fn generate_function_main(
+            run_function: FunctionValue<'a>,
             context: &Context,
             builder: &Builder<'a>,
             functions: &mut Functions<'a>,
@@ -1186,7 +1341,7 @@ mod state {
                 .build_store(address_ptr, type_holder.size().const_zero())
                 .unwrap();
 
-            /*let ensure_address = |index: i64| {
+            let ensure_address = |index: i64| {
                 builder
                     .build_direct_call(
                         Self::function(
@@ -1214,8 +1369,17 @@ mod state {
                     .unwrap()
             };
 
-            ensure_address(0);
-            ensure_address(5);
+            Self::generate_printf(
+                "beginning: memory_ptr: %p\n",
+                &[builder
+                    .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_ptr")
+                    .unwrap()
+                    .into()],
+                builder,
+                functions,
+            );
+
+            /*ensure_address(5);
             ensure_address(-20);
             ensure_address(15);
             ensure_address(-60);
@@ -1224,25 +1388,44 @@ mod state {
             ensure_address(-8);
             ensure_address(1024);*/
 
-            // mem_dump()
+            /*
+            types.pointer().into(), // address_ptr (size_t*)
+            types.pointer().into(), // memory_ptr_ptr (char**)
+            types.pointer().into(), // capacity_ptr (size_t*)
+            types.pointer().into(), // offset_ptr (size_t*)
+             */
             builder
                 .build_direct_call(
-                    Self::function(FunctionDeclaration::MemDump, functions),
+                    run_function,
                     &[
-                        builder
-                            .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_ptr")
-                            .unwrap()
-                            .into_pointer_value()
-                            .into(),
-                        builder
-                            .build_load(type_holder.size(), capacity_ptr, "capacity")
-                            .unwrap()
-                            .into_int_value()
-                            .into(),
+                        address_ptr.into(),
+                        memory_ptr_ptr.into(),
+                        capacity_ptr.into(),
+                        offset_ptr.into(),
                     ],
                     "",
                 )
                 .unwrap();
+
+            // mem_dump()
+            /*builder
+            .build_direct_call(
+                Self::function(FunctionDeclaration::MemDump, functions),
+                &[
+                    builder
+                        .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_ptr")
+                        .unwrap()
+                        .into_pointer_value()
+                        .into(),
+                    builder
+                        .build_load(type_holder.size(), capacity_ptr, "capacity")
+                        .unwrap()
+                        .into_int_value()
+                        .into(),
+                ],
+                "",
+            )
+            .unwrap();*/
 
             builder
                 .build_direct_call(
@@ -1285,15 +1468,175 @@ mod state {
             builder.position_at_end(after_branch_block);
         }
 
-        pub(super) fn emit_code_for_statement(&self, statement: &Statement) {
+        fn emit_code_for_statement(
+            statement: &Statement,
+            after_block: BasicBlock<'a>,
+            context: &Context,
+            builder: &Builder<'a>,
+            functions: &Functions<'a>,
+            module: &Module<'a>,
+            type_holder: &dyn TypeHolder<'a>,
+        ) {
+            /*
+            types.pointer().into(), // address_ptr (size_t*)
+            types.pointer().into(), // memory_ptr_ptr (char**)
+            types.pointer().into(), // capacity_ptr (size_t*)
+            types.pointer().into(), // offset_ptr (size_t*)
+             */
+            let current_function = builder.get_insert_block().unwrap().get_parent().unwrap();
+            let address_ptr = current_function
+                .get_nth_param(0)
+                .unwrap()
+                .into_pointer_value();
+            let memory_ptr_ptr = current_function
+                .get_nth_param(1)
+                .unwrap()
+                .into_pointer_value();
+            let capacity_ptr = current_function
+                .get_nth_param(2)
+                .unwrap()
+                .into_pointer_value();
+            let offset_ptr = current_function
+                .get_nth_param(3)
+                .unwrap()
+                .into_pointer_value();
+
+            Self::generate_printf(
+                "inside 'emit_code_for_statement'\n",
+                &[],
+                builder,
+                functions,
+            );
+            Self::generate_printf(
+                "memory_ptr: %p\n",
+                &[builder
+                    .build_load(type_holder.pointer(), memory_ptr_ptr, "memory_ptr")
+                    .unwrap()
+                    .into()],
+                builder,
+                functions,
+            );
+            Self::generate_printf(
+                "address: %zu\n",
+                &[builder
+                    .build_load(type_holder.size(), address_ptr, "address_ptr")
+                    .unwrap()
+                    .into()],
+                builder,
+                functions,
+            );
+
             match statement {
-                Statement::IncrementPointer => {}
-                Statement::DecrementPointer => {}
-                Statement::IncrementValue => {}
-                Statement::DecrementValue => {}
-                Statement::PutChar => {}
-                Statement::GetChar => {}
-                Statement::Loop(_) => {}
+                Statement::IncrementPointer => {
+                    let address = builder
+                        .build_load(type_holder.size(), address_ptr, "address")
+                        .unwrap()
+                        .into_int_value();
+                    let incremented = builder
+                        .build_int_add(
+                            address,
+                            type_holder.size().const_int(1, false),
+                            "incremented",
+                        )
+                        .unwrap();
+                    builder.build_store(address_ptr, incremented).unwrap();
+
+                    builder.build_unconditional_branch(after_block).unwrap();
+                }
+                Statement::DecrementPointer => {
+                    builder.build_unconditional_branch(after_block).unwrap();
+                }
+                Statement::IncrementValue => {
+                    let value = builder
+                        .build_direct_call(
+                            Self::function(FunctionDeclaration::Read, functions),
+                            &[
+                                builder
+                                    .build_load(type_holder.size(), address_ptr, "address")
+                                    .unwrap()
+                                    .into_int_value()
+                                    .into(),
+                                memory_ptr_ptr.into(),
+                                capacity_ptr.into(),
+                                offset_ptr.into(),
+                            ],
+                            "value",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_left()
+                        .into_int_value();
+                    let incremented = builder
+                        .build_int_add(value, type_holder.char().const_int(1, false), "incremented")
+                        .unwrap();
+
+                    builder
+                        .build_direct_call(
+                            Self::function(FunctionDeclaration::Write, functions),
+                            &[
+                                builder
+                                    .build_load(type_holder.size(), address_ptr, "address")
+                                    .unwrap()
+                                    .into_int_value()
+                                    .into(),
+                                incremented.into(),
+                                memory_ptr_ptr.into(),
+                                capacity_ptr.into(),
+                                offset_ptr.into(),
+                            ],
+                            "",
+                        )
+                        .unwrap();
+                    builder.build_unconditional_branch(after_block).unwrap();
+                }
+                Statement::DecrementValue => {
+                    builder.build_unconditional_branch(after_block).unwrap();
+                }
+                Statement::PutChar => {
+                    Self::generate_printf("inside putchar\n", &[], builder, functions);
+                    let value = builder
+                        .build_direct_call(
+                            Self::function(FunctionDeclaration::Read, functions),
+                            &[
+                                builder
+                                    .build_load(type_holder.size(), address_ptr, "address")
+                                    .unwrap()
+                                    .into_int_value()
+                                    .into(),
+                                memory_ptr_ptr.into(),
+                                capacity_ptr.into(),
+                                offset_ptr.into(),
+                            ],
+                            "value",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_left()
+                        .into_int_value();
+                    let int_value = builder
+                        .build_int_cast(value, type_holder.int(), "int_value")
+                        .unwrap();
+                    Self::generate_printf(
+                        "  int value = %d\n",
+                        &[int_value.into()],
+                        builder,
+                        functions,
+                    );
+                    builder
+                        .build_direct_call(
+                            Self::function(FunctionDeclaration::Putchar, functions),
+                            &[int_value.into()],
+                            "",
+                        )
+                        .unwrap();
+                    builder.build_unconditional_branch(after_block).unwrap();
+                }
+                Statement::GetChar => {
+                    builder.build_unconditional_branch(after_block).unwrap();
+                }
+                Statement::Loop(_) => {
+                    builder.build_unconditional_branch(after_block).unwrap();
+                }
             }
         }
     }
@@ -1308,9 +1651,7 @@ pub(crate) fn emit(program: &Program, arguments: &CommandLineArguments) -> anyho
         .to_ascii_lowercase();
 
     let context = Context::create();
-    let mut state = State::new(&context, &module_name);
-
-    for statement in program.statements() {}
+    let state = State::new(&context, &module_name, program);
 
     state.verify()?;
 
