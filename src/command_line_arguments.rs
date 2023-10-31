@@ -1,3 +1,4 @@
+use clap::ValueEnum;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,9 @@ pub(crate) struct CommandLineArguments {
     pub(crate) emit_llvm: bool,
 
     pub(crate) input_filename: PathBuf,
+
+    #[arg(short = 'O', value_parser = clap::value_parser!(u8).range(0..=3), help = "Sets the optimization level", default_value_t = 2)]
+    optimization_level: u8,
 }
 
 impl CommandLineArguments {
@@ -60,6 +64,16 @@ impl CommandLineArguments {
             (false, false, true) => EmitTarget::LlvmIr,
             (false, false, false) => EmitTarget::Executable,
             _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn optimization_level(&self) -> inkwell::OptimizationLevel {
+        match self.optimization_level {
+            0 => inkwell::OptimizationLevel::None,
+            1 => inkwell::OptimizationLevel::Less,
+            2 => inkwell::OptimizationLevel::Default,
+            3 => inkwell::OptimizationLevel::Aggressive,
+            _ => unreachable!("value was checked by clap"),
         }
     }
 

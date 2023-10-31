@@ -83,6 +83,7 @@ mod state {
         Printf,
         Read,
         Write,
+        GetChar,
     }
 
     struct TypeContainer<'a> {
@@ -222,11 +223,153 @@ mod state {
         }
 
         pub(super) fn optimize(&self, level: OptimizationLevel) {
+            println!("optimization level: {level:?}");
             let pass_manager_builder = PassManagerBuilder::create();
             pass_manager_builder.set_optimization_level(level);
 
             let module_pass_manager = PassManager::create(());
             pass_manager_builder.populate_module_pass_manager(&module_pass_manager);
+            #[cfg(any(
+                feature = "llvm4-0",
+                feature = "llvm5-0",
+                feature = "llvm6-0",
+                feature = "llvm7-0",
+                feature = "llvm8-0",
+                feature = "llvm9-0",
+                feature = "llvm10-0",
+                feature = "llvm11-0",
+                feature = "llvm12-0",
+                feature = "llvm13-0",
+                feature = "llvm14-0"
+            ))]
+            module_pass_manager.add_argument_promotion_pass();
+            module_pass_manager.add_constant_merge_pass();
+            #[cfg(not(any(
+                feature = "llvm4-0",
+                feature = "llvm5-0",
+                feature = "llvm6-0",
+                feature = "llvm7-0",
+                feature = "llvm8-0",
+                feature = "llvm9-0"
+            )))]
+            module_pass_manager.add_merge_functions_pass();
+            module_pass_manager.add_dead_arg_elimination_pass();
+            module_pass_manager.add_function_attrs_pass();
+            module_pass_manager.add_function_inlining_pass();
+            module_pass_manager.add_always_inliner_pass();
+            module_pass_manager.add_global_dce_pass();
+            module_pass_manager.add_global_optimizer_pass();
+            #[cfg(not(any(
+                feature = "llvm12-0",
+                feature = "llvm13-0",
+                feature = "llvm14-0",
+                feature = "llvm15-0",
+                feature = "llvm16-0"
+            )))]
+            //module_pass_manager.add_ip_constant_propagation_pass();
+            /*#[cfg(not(feature = "llvm16-0"))]
+            module_pass_manager.add_prune_eh_pass();*/
+            module_pass_manager.add_ipsccp_pass();
+            module_pass_manager.add_internalize_pass(true);
+            module_pass_manager.add_strip_dead_prototypes_pass();
+            module_pass_manager.add_strip_symbol_pass();
+            #[cfg(feature = "llvm4-0")]
+            module_pass_manager.add_bb_vectorize_pass();
+            module_pass_manager.add_loop_vectorize_pass();
+            module_pass_manager.add_slp_vectorize_pass();
+            module_pass_manager.add_aggressive_dce_pass();
+            module_pass_manager.add_bit_tracking_dce_pass();
+            module_pass_manager.add_alignment_from_assumptions_pass();
+            module_pass_manager.add_cfg_simplification_pass();
+            module_pass_manager.add_dead_store_elimination_pass();
+            module_pass_manager.add_scalarizer_pass();
+            module_pass_manager.add_merged_load_store_motion_pass();
+            module_pass_manager.add_gvn_pass();
+            module_pass_manager.add_ind_var_simplify_pass();
+            module_pass_manager.add_instruction_combining_pass();
+            module_pass_manager.add_jump_threading_pass();
+            module_pass_manager.add_licm_pass();
+            module_pass_manager.add_loop_deletion_pass();
+            module_pass_manager.add_loop_idiom_pass();
+            module_pass_manager.add_loop_rotate_pass();
+            module_pass_manager.add_loop_reroll_pass();
+            module_pass_manager.add_loop_unroll_pass();
+            #[cfg(any(
+                feature = "llvm4-0",
+                feature = "llvm5-0",
+                feature = "llvm6-0",
+                feature = "llvm7-0",
+                feature = "llvm8-0",
+                feature = "llvm9-0",
+                feature = "llvm10-0",
+                feature = "llvm11-0",
+                feature = "llvm12-0",
+                feature = "llvm13-0",
+                feature = "llvm14-0"
+            ))]
+            module_pass_manager.add_loop_unswitch_pass();
+            module_pass_manager.add_memcpy_optimize_pass();
+            module_pass_manager.add_partially_inline_lib_calls_pass();
+            module_pass_manager.add_lower_switch_pass();
+            module_pass_manager.add_promote_memory_to_register_pass();
+            module_pass_manager.add_reassociate_pass();
+            module_pass_manager.add_sccp_pass();
+            module_pass_manager.add_scalar_repl_aggregates_pass();
+            module_pass_manager.add_scalar_repl_aggregates_pass_ssa();
+            module_pass_manager.add_scalar_repl_aggregates_pass_with_threshold(1);
+            module_pass_manager.add_simplify_lib_calls_pass();
+            module_pass_manager.add_tail_call_elimination_pass();
+            /*#[cfg(not(any(
+                feature = "llvm12-0",
+                feature = "llvm13-0",
+                feature = "llvm14-0",
+                feature = "llvm15-0",
+                feature = "llvm16-0"
+            )))]
+            module_pass_manager.add_constant_propagation_pass();*/
+            #[cfg(any(
+                feature = "llvm12-0",
+                feature = "llvm13-0",
+                feature = "llvm14-0",
+                feature = "llvm15-0",
+                feature = "llvm16-0"
+            ))]
+            module_pass_manager.add_instruction_simplify_pass();
+            module_pass_manager.add_demote_memory_to_register_pass();
+            module_pass_manager.add_verifier_pass();
+            module_pass_manager.add_correlated_value_propagation_pass();
+            module_pass_manager.add_early_cse_pass();
+            module_pass_manager.add_lower_expect_intrinsic_pass();
+            module_pass_manager.add_type_based_alias_analysis_pass();
+            module_pass_manager.add_scoped_no_alias_aa_pass();
+            module_pass_manager.add_basic_alias_analysis_pass();
+            module_pass_manager.add_early_cse_mem_ssa_pass();
+            module_pass_manager.add_new_gvn_pass();
+
+            /*#[cfg(not(any(
+                feature = "llvm4-0",
+                feature = "llvm5-0",
+                feature = "llvm6-0",
+                feature = "llvm16-0"
+            )))]
+            module_pass_manager.add_aggressive_inst_combiner_pass();*/
+            #[cfg(not(any(feature = "llvm4-0", feature = "llvm5-0", feature = "llvm6-0")))]
+            module_pass_manager.add_loop_unroll_and_jam_pass();
+
+            /*#[cfg(not(any(
+                feature = "llvm4-0",
+                feature = "llvm5-0",
+                feature = "llvm6-0",
+                feature = "llvm7-0",
+                feature = "llvm15-0",
+                feature = "llvm16-0"
+            )))]
+            {
+                module_pass_manager.add_coroutine_early_pass();
+                module_pass_manager.add_coroutine_split_pass();
+                module_pass_manager.add_coroutine_elide_pass();
+                module_pass_manager.add_coroutine_cleanup_pass();
+            }*/
 
             let optimized_module = module_pass_manager.run_on(&self.module);
             dbg!(optimized_module);
@@ -288,6 +431,19 @@ mod state {
             module: &Module<'a>,
             type_holder: &dyn TypeHolder<'a>,
         ) {
+            functions.insert(
+                FunctionDeclaration::GetChar,
+                Self::create_function(
+                    "getchar",
+                    &[],
+                    Some(&type_holder.int()),
+                    Some(Linkage::External),
+                    false,
+                    module,
+                    type_holder,
+                ),
+            );
+
             functions.insert(
                 FunctionDeclaration::Putchar,
                 Self::create_function(
@@ -1143,6 +1299,37 @@ mod state {
                 .build_store(address_ptr, type_holder.size().const_zero())
                 .unwrap();
 
+            let ensure_address = |index: i64| {
+                builder
+                    .build_direct_call(
+                        Self::function(
+                            FunctionDeclaration::EnsureSufficientMemoryCapacity,
+                            functions,
+                        ),
+                        &[
+                            memory_ptr_ptr.into(),
+                            capacity_ptr.into(),
+                            offset_ptr.into(),
+                            if index < 0 {
+                                builder
+                                    .build_int_neg(
+                                        type_holder.size().const_int((-index) as u64, false),
+                                        "",
+                                    )
+                                    .unwrap()
+                                    .into()
+                            } else {
+                                type_holder.size().const_int(index as u64, false).into()
+                            },
+                        ],
+                        "",
+                    )
+                    .unwrap()
+            };
+
+            ensure_address(15000);
+            ensure_address(-15000);
+
             builder
                 .build_direct_call(
                     run_function,
@@ -1376,7 +1563,38 @@ mod state {
                         .unwrap();
                 }
                 Statement::GetChar => {
-                    // todo
+                    let value = builder
+                        .build_direct_call(
+                            Self::function(FunctionDeclaration::GetChar, functions),
+                            &[],
+                            "value",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_left()
+                        .into_int_value();
+
+                    let char_value = builder
+                        .build_int_cast(value, type_holder.char(), "char_value")
+                        .unwrap();
+
+                    builder
+                        .build_direct_call(
+                            Self::function(FunctionDeclaration::Write, functions),
+                            &[
+                                builder
+                                    .build_load(type_holder.size(), address_ptr, "address")
+                                    .unwrap()
+                                    .into_int_value()
+                                    .into(),
+                                char_value.into(),
+                                memory_ptr_ptr.into(),
+                                capacity_ptr.into(),
+                                offset_ptr.into(),
+                            ],
+                            "",
+                        )
+                        .unwrap();
                 }
                 Statement::Loop(statements) => {
                     let current_function =
@@ -1461,7 +1679,7 @@ pub(crate) fn emit(program: &Program, arguments: &CommandLineArguments) -> anyho
         Err(error) => eprintln!("{error:?}"),
     }
 
-    state.optimize(OptimizationLevel::None);
+    state.optimize(arguments.optimization_level());
 
     match arguments.emit_target() {
         EmitTarget::Assembly => {
