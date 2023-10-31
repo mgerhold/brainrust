@@ -193,7 +193,7 @@ mod state {
                     TargetMachine::get_host_cpu_name().to_str().unwrap(),
                     TargetMachine::get_host_cpu_features().to_str().unwrap(),
                     OptimizationLevel::Aggressive,
-                    RelocMode::Default,
+                    RelocMode::PIC,
                     CodeModel::Default,
                 )
                 .unwrap();
